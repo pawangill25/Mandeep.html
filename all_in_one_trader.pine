@@ -24,11 +24,8 @@
 //  the cleanest view enable EITHER RSI or Volume at a time — not both at once.
 // =============================================================================
 
-indicator(title     = "All-in-One Trader (MA + S/R + RSI + Vol + Patterns)",
-          shorttitle = "AIO Trader",
-          overlay    = false,            // script's home = lower pane (for RSI/Vol)
-          max_lines_count  = 500,        // plenty of room for S/R lines
-          max_labels_count = 500)        // plenty of room for cross/pattern labels
+// NOTE: the declaration MUST be on one line — Pine errors if indicator() is split.
+indicator("All-in-One Trader (MA + S/R + RSI + Vol + Patterns)", "AIO Trader", overlay=false, max_lines_count=500, max_labels_count=500)
 
 
 // =============================================================================
