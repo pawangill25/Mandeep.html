@@ -1,0 +1,367 @@
+//@version=5
+// =============================================================================
+//  ALL-IN-ONE TRADER  —  Pine Script v5
+// -----------------------------------------------------------------------------
+//  A single, clean, fully-commented indicator for both day trading (intraday)
+//  and swing / long-term trading (daily charts).
+//
+//  WHAT'S INSIDE (every block can be toggled on/off in Settings):
+//    1. Moving Averages (fast / medium / slow) + Golden/Death cross + trend tint
+//    2. Trading-style preset (Day / Swing / Long-Term) that auto-sets lengths
+//    3. Auto Support & Resistance from pivots (self-cleaning lines)
+//    4. RSI momentum in the lower pane (overbought / oversold)
+//    5. Volume + volume average + spike highlight
+//    6. "Extended / Don't Chase" warning (distance from the 50 MA)
+//    7. Candlestick reversals (Hammer, Shooting Star, Bull/Bear Engulfing)
+//    8. alertcondition() hooks for every signal above
+//
+//  ── IMPORTANT DESIGN NOTE (the one real Pine limitation) ─────────────────────
+//  A SINGLE Pine script only gets the main price chart PLUS *one* extra pane.
+//  It cannot create two independent sub-panes. So this script lives in a lower
+//  pane (overlay=false) and "pushes" all the price-chart drawings up onto the
+//  candles with `force_overlay=true`. RSI naturally fills the lower pane.
+//  Volume *shares* that same lower pane with RSI (auto-scaled to 0-100), so for
+//  the cleanest view enable EITHER RSI or Volume at a time — not both at once.
+// =============================================================================
+
+indicator(title     = "All-in-One Trader (MA + S/R + RSI + Vol + Patterns)",
+          shorttitle = "AIO Trader",
+          overlay    = false,            // script's home = lower pane (for RSI/Vol)
+          max_lines_count  = 500,        // plenty of room for S/R lines
+          max_labels_count = 500)        // plenty of room for cross/pattern labels
+
+
+// =============================================================================
+// SECTION 1 — INPUTS  (grouped so the Settings panel stays organised)
+// =============================================================================
+
+// ── ① Trading-style preset ───────────────────────────────────────────────────
+g_style = "① Trading Style Preset"
+tradingStyle = input.string("Swing", "Trading Style",
+     options = ["Day Trading", "Swing", "Long-Term"], group = g_style,
+     tooltip = "Auto-sets the MA lengths and the S/R pivot lookback. " +
+               "Tick the manual override below if you'd rather set them yourself.")
+manualMA = input.bool(false, "Override lengths & pivot manually", group = g_style,
+     tooltip = "When ON, the script uses YOUR length/pivot inputs below instead " +
+               "of the preset values.")
+
+// ── ② Moving Averages ────────────────────────────────────────────────────────
+g_ma = "② Moving Averages (trend)"
+showMA    = input.bool(true,  "Show moving averages",          group = g_ma)
+maType    = input.string("EMA", "MA type", options = ["EMA", "SMA"], group = g_ma)
+fastInput = input.int(20,  "Fast length",   minval = 1, group = g_ma)
+medInput  = input.int(50,  "Medium length", minval = 1, group = g_ma)
+slowInput = input.int(200, "Slow length",   minval = 1, group = g_ma)
+showCross = input.bool(true, "Label Golden / Death cross",     group = g_ma)
+showTrend = input.bool(true, "Faint background trend tint",    group = g_ma)
+
+// ── ③ Support / Resistance ───────────────────────────────────────────────────
+g_sr = "③ Support / Resistance"
+showSR     = input.bool(true, "Show support / resistance",       group = g_sr)
+pivotInput = input.int(10, "Pivot lookback (bars each side)", minval = 1, group = g_sr,
+     tooltip = "Bigger = fewer, more significant levels. Smaller = more, " +
+               "more reactive levels (good for intraday).")
+maxLevels  = input.int(5, "Max levels to keep (per side)", minval = 1, maxval = 10, group = g_sr)
+resColor   = input.color(color.red,   "Resistance colour", group = g_sr)
+supColor   = input.color(color.green, "Support colour",    group = g_sr)
+
+// ── ④ RSI momentum (lower pane) ──────────────────────────────────────────────
+g_rsi = "④ RSI Momentum (lower pane)"
+showRSI = input.bool(true, "Show RSI",            group = g_rsi)
+rsiLen  = input.int(14, "RSI length", minval = 1, group = g_rsi)
+rsiOB   = input.int(70, "Overbought level",       group = g_rsi)
+rsiOS   = input.int(30, "Oversold level",         group = g_rsi)
+rsiTint = input.bool(true, "Tint pane at extremes", group = g_rsi)
+
+// ── ⑤ Volume (shares the lower pane with RSI) ────────────────────────────────
+g_vol = "⑤ Volume (shares lower pane)"
+showVol      = input.bool(false, "Show volume", group = g_vol,
+     tooltip = "A single Pine script only gets ONE lower pane, so volume shares " +
+               "it with RSI and is auto-scaled to 0-100. For a clean view, turn " +
+               "on EITHER RSI or Volume — not both.")
+volMaLen     = input.int(20, "Volume MA length", minval = 1, group = g_vol)
+volSpikeMult = input.float(1.5, "Spike = x times average", minval = 1.0, step = 0.1, group = g_vol)
+
+// ── ⑥ Extended / Don't-Chase warning ─────────────────────────────────────────
+g_ext = "⑥ Extended / Don't Chase"
+showExt   = input.bool(true, "Warn when extended from medium MA", group = g_ext)
+extThresh = input.float(5.0, "Extended threshold (%)", minval = 0.1, step = 0.5, group = g_ext,
+     tooltip = "Flags the bar where price first stretches more than this % away " +
+               "from the medium (50) MA — a reminder not to chase.")
+
+// ── ⑦ Candlestick reversals ──────────────────────────────────────────────────
+g_pat = "⑦ Candlestick Reversals"
+showPat = input.bool(true, "Show candlestick signals", group = g_pat)
+
+
+// =============================================================================
+// SECTION 2 — APPLY THE TRADING-STYLE PRESET
+// -----------------------------------------------------------------------------
+// We translate the chosen style into sensible default lengths + pivot lookback.
+// If "Override manually" is ON we ignore these and use the raw inputs instead.
+// =============================================================================
+
+presetFast  = switch tradingStyle
+    "Day Trading" => 9
+    "Swing"       => 20
+    "Long-Term"   => 20
+    => 20
+presetMed   = switch tradingStyle
+    "Day Trading" => 20
+    "Swing"       => 50
+    "Long-Term"   => 50
+    => 50
+presetSlow  = switch tradingStyle
+    "Day Trading" => 50
+    "Swing"       => 100
+    "Long-Term"   => 200
+    => 200
+presetPivot = switch tradingStyle
+    "Day Trading" => 5
+    "Swing"       => 10
+    "Long-Term"   => 20
+    => 10
+
+// Final values actually used everywhere below:
+fastLen  = manualMA ? fastInput  : presetFast
+medLen   = manualMA ? medInput   : presetMed
+slowLen  = manualMA ? slowInput  : presetSlow
+pivotLen = manualMA ? pivotInput : presetPivot
+
+
+// =============================================================================
+// SECTION 3 — MOVING AVERAGES + TREND + CROSSES
+// =============================================================================
+
+// One small helper so "EMA vs SMA" is a single switch for all three MAs.
+f_ma(src, len) => maType == "EMA" ? ta.ema(src, len) : ta.sma(src, len)
+
+fastMA = f_ma(close, fastLen)
+medMA  = f_ma(close, medLen)
+slowMA = f_ma(close, slowLen)
+
+// Plot the three MAs on the PRICE chart (force_overlay pushes them up there).
+plot(showMA ? fastMA : na, "Fast MA",   color = color.new(color.aqua,    0), linewidth = 1, force_overlay = true)
+plot(showMA ? medMA  : na, "Medium MA", color = color.new(color.orange,  0), linewidth = 2, force_overlay = true)
+plot(showMA ? slowMA : na, "Slow MA",   color = color.new(color.fuchsia, 0), linewidth = 2, force_overlay = true)
+
+// Golden Cross = medium crosses ABOVE slow ; Death Cross = medium crosses BELOW.
+golden = ta.crossover(medMA,  slowMA)
+death  = ta.crossunder(medMA, slowMA)
+
+if showCross and golden
+    label.new(bar_index, slowMA, "Golden Cross", style = label.style_label_up,
+         color = color.new(color.green, 0), textcolor = color.white,
+         size = size.small, force_overlay = true)
+if showCross and death
+    label.new(bar_index, slowMA, "Death Cross", style = label.style_label_down,
+         color = color.new(color.red, 0), textcolor = color.white,
+         size = size.small, force_overlay = true)
+
+// Trend state: BULLISH = price > medium > slow ; BEARISH = price < medium < slow.
+trendBull = close > medMA and medMA > slowMA
+trendBear = close < medMA and medMA < slowMA
+
+// Faint background tint on the price chart (90% transparent = very subtle).
+bgcolor(showTrend and trendBull ? color.new(color.green, 90) :
+         showTrend and trendBear ? color.new(color.red,   90) : na,
+         force_overlay = true)
+
+// A tiny floating label showing the current trend word (only on the last bar).
+var label trendLbl = na
+trendTxt = trendBull ? "BULLISH" : trendBear ? "BEARISH" : "NEUTRAL"
+trendClr = trendBull ? color.green : trendBear ? color.red : color.gray
+if showTrend and barstate.islast
+    if not na(trendLbl)
+        label.delete(trendLbl)
+    trendLbl := label.new(bar_index, high, "Trend: " + trendTxt,
+         style = label.style_label_left, color = color.new(trendClr, 20),
+         textcolor = color.white, size = size.small, force_overlay = true)
+
+
+// =============================================================================
+// SECTION 4 — AUTO SUPPORT & RESISTANCE  (the "tricky" one)
+// -----------------------------------------------------------------------------
+// We use confirmed pivot highs/lows. A pivot needs `pivotLen` bars on EACH side,
+// so ta.pivothigh/low report the level `pivotLen` bars AFTER it actually formed.
+//
+// We keep the lines in arrays and cap how many we show (oldest is removed first).
+// "Self-cleaning": when price closes through a level we delete that line, since
+// a broken level is no longer valid support/resistance.
+//
+// TRADEOFF: this is a clean, reliable level finder — not a clustering engine.
+// Very choppy markets can still produce a few overlapping levels; raise the
+// pivot lookback to thin them out.
+// =============================================================================
+
+var line[] resLines = array.new_line()   // active resistance lines
+var line[] supLines = array.new_line()   // active support lines
+
+ph = ta.pivothigh(pivotLen, pivotLen)     // non-na when a swing HIGH is confirmed
+pl = ta.pivotlow(pivotLen, pivotLen)      // non-na when a swing LOW  is confirmed
+
+// New resistance line at a confirmed pivot high.
+if showSR and not na(ph)
+    nl = line.new(bar_index - pivotLen, ph, bar_index, ph,
+         extend = extend.right, color = resColor, width = 1, force_overlay = true)
+    array.push(resLines, nl)
+    if array.size(resLines) > maxLevels          // keep only the most recent N
+        line.delete(array.shift(resLines))       // drop the oldest
+
+// New support line at a confirmed pivot low.
+if showSR and not na(pl)
+    nl = line.new(bar_index - pivotLen, pl, bar_index, pl,
+         extend = extend.right, color = supColor, width = 1, force_overlay = true)
+    array.push(supLines, nl)
+    if array.size(supLines) > maxLevels
+        line.delete(array.shift(supLines))
+
+// Self-clean: delete levels that price has just closed through. We loop from the
+// top down so removing an item doesn't shift the indexes we still need to visit.
+resBroken = false
+supBroken = false
+
+i = array.size(resLines) - 1
+while i >= 0
+    ln = array.get(resLines, i)
+    lvl = line.get_y1(ln)                         // horizontal line → y1 == price
+    if close > lvl and close[1] <= lvl            // fresh upside break
+        line.delete(ln)
+        array.remove(resLines, i)
+        resBroken := true
+    i -= 1
+
+j = array.size(supLines) - 1
+while j >= 0
+    ln2 = array.get(supLines, j)
+    lvl2 = line.get_y1(ln2)
+    if close < lvl2 and close[1] >= lvl2          // fresh downside break
+        line.delete(ln2)
+        array.remove(supLines, j)
+        supBroken := true
+    j -= 1
+
+
+// =============================================================================
+// SECTION 5 — RSI MOMENTUM  (draws naturally in the lower pane)
+// =============================================================================
+
+rsiVal = ta.rsi(close, rsiLen)
+
+plot(showRSI ? rsiVal : na, "RSI", color = color.new(color.purple, 0), linewidth = 2)
+
+// Reference levels. hlines need constant inputs, so we draw them always; they're
+// harmless guides that only mean anything when RSI is shown.
+hline(rsiOB, "Overbought", color = color.new(color.red,   50), linestyle = hline.style_dashed)
+hline(rsiOS, "Oversold",   color = color.new(color.green, 50), linestyle = hline.style_dashed)
+hline(50,    "Midline",    color = color.new(color.gray,  70), linestyle = hline.style_dotted)
+
+// Optional pane tint when RSI is at an extreme (no force_overlay = stays in pane).
+rsiHot  = showRSI and rsiTint and rsiVal > rsiOB
+rsiCold = showRSI and rsiTint and rsiVal < rsiOS
+bgcolor(rsiHot  ? color.new(color.red,   85) :
+         rsiCold ? color.new(color.green, 85) : na)
+
+
+// =============================================================================
+// SECTION 6 — VOLUME  (shares the lower pane; auto-scaled to 0-100)
+// =============================================================================
+
+volMa    = ta.sma(volume, volMaLen)
+volSpike = volume > volMa * volSpikeMult          // spike = well above its average
+
+// Normalise to 0-100 using the highest volume of the last 100 bars, so the
+// columns sit comfortably on the same axis as RSI.
+volMax    = ta.highest(volume, 100)
+volNorm   = volMax > 0 ? volume / volMax * 100 : 0
+volMaNorm = volMax > 0 ? volMa  / volMax * 100 : 0
+
+volCol = volSpike ? color.new(color.yellow, 0) : color.new(color.blue, 55)
+plot(showVol ? volNorm   : na, "Volume (norm)", color = volCol, style = plot.style_columns)
+plot(showVol ? volMaNorm : na, "Vol MA (norm)", color = color.new(color.orange, 0), linewidth = 2)
+
+
+// =============================================================================
+// SECTION 7 — "EXTENDED / DON'T CHASE" WARNING
+// -----------------------------------------------------------------------------
+// How far (in %) is price from the medium MA? When it first stretches past the
+// threshold we mark the bar — a nudge not to chase an over-extended move.
+// =============================================================================
+
+extPct     = medMA != 0 ? (close - medMA) / medMA * 100 : 0
+extendedUp = showExt and extPct >  extThresh and extPct[1] <=  extThresh   // just got stretched UP
+extendedDn = showExt and extPct < -extThresh and extPct[1] >= -extThresh   // just got stretched DOWN
+
+plotshape(extendedUp, "Extended Up", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.red, 0),
+     text = "EXT", textcolor = color.red, size = size.tiny, force_overlay = true)
+plotshape(extendedDn, "Extended Down", style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.green, 0),
+     text = "EXT", textcolor = color.green, size = size.tiny, force_overlay = true)
+
+
+// =============================================================================
+// SECTION 8 — CANDLESTICK REVERSAL PATTERNS
+// -----------------------------------------------------------------------------
+// Body / wick geometry, plus a light trend filter so signals appear where they
+// actually matter (hammers in pullbacks, shooting stars in rallies, etc.).
+// =============================================================================
+
+body   = math.abs(close - open)
+rng    = high - low
+upWick = high - math.max(open, close)
+dnWick = math.min(open, close) - low
+upBar  = close > open
+dnBar  = close < open
+
+// Hammer: tiny body up top, long lower wick, little upper wick — seen in a dip.
+hammer = showPat and body > 0 and rng > 0 and dnWick > body * 2 and upWick < body and close < medMA
+
+// Shooting Star: tiny body down low, long upper wick — seen after a push up.
+shootingStar = showPat and body > 0 and rng > 0 and upWick > body * 2 and dnWick < body and close > medMA
+
+// Bullish Engulfing: today's green body fully engulfs yesterday's red body.
+bullEngulf = showPat and upBar and close[1] < open[1] and close >= open[1] and open <= close[1]
+
+// Bearish Engulfing: today's red body fully engulfs yesterday's green body.
+bearEngulf = showPat and dnBar and close[1] > open[1] and close <= open[1] and open >= close[1]
+
+plotshape(hammer, "Hammer", style = shape.triangleup, location = location.belowbar,
+     color = color.new(color.green, 0), text = "H", textcolor = color.green,
+     size = size.tiny, force_overlay = true)
+plotshape(shootingStar, "Shooting Star", style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.red, 0), text = "SS", textcolor = color.red,
+     size = size.tiny, force_overlay = true)
+plotshape(bullEngulf, "Bullish Engulfing", style = shape.labelup, location = location.belowbar,
+     color = color.new(color.green, 0), text = "BE", textcolor = color.white,
+     size = size.tiny, force_overlay = true)
+plotshape(bearEngulf, "Bearish Engulfing", style = shape.labeldown, location = location.abovebar,
+     color = color.new(color.red, 0), text = "BE", textcolor = color.white,
+     size = size.tiny, force_overlay = true)
+
+
+// =============================================================================
+// SECTION 9 — ALERTS
+// -----------------------------------------------------------------------------
+// Each alertcondition() shows up in TradingView's "Add Alert" → Condition list.
+// They evaluate every bar; pick the ones you want when you create an alert.
+// =============================================================================
+
+rsiCrossOB = ta.crossover(rsiVal,  rsiOB)         // RSI just entered overbought
+rsiCrossOS = ta.crossunder(rsiVal, rsiOS)         // RSI just entered oversold
+
+alertcondition(golden,     "Golden Cross",       "Golden Cross: medium MA crossed ABOVE slow MA")
+alertcondition(death,      "Death Cross",        "Death Cross: medium MA crossed BELOW slow MA")
+alertcondition(resBroken,  "Resistance Broken",  "Price closed ABOVE a resistance level")
+alertcondition(supBroken,  "Support Broken",     "Price closed BELOW a support level")
+alertcondition(rsiCrossOB, "RSI Overbought",     "RSI crossed above the overbought level")
+alertcondition(rsiCrossOS, "RSI Oversold",       "RSI crossed below the oversold level")
+alertcondition(volSpike,   "Volume Spike",       "Volume spike: volume above its average multiple")
+alertcondition(hammer,     "Hammer",             "Hammer candle detected")
+alertcondition(shootingStar,"Shooting Star",     "Shooting Star candle detected")
+alertcondition(bullEngulf, "Bullish Engulfing",  "Bullish Engulfing detected")
+alertcondition(bearEngulf, "Bearish Engulfing",  "Bearish Engulfing detected")
+
+// =============================================================================
+//  END — happy (and disciplined) trading. Don't chase. ✦
+// =============================================================================
