@@ -25,7 +25,10 @@
 // =============================================================================
 
 // NOTE: the declaration MUST be on one line — Pine errors if indicator() is split.
-indicator("All-in-One Trader (MA + S/R + RSI + Vol + Patterns)", "AIO Trader", overlay=false, max_lines_count=500, max_labels_count=500)
+// max_bars_back fixes data-dependent runtime errors on some symbols by giving Pine
+// an explicit historical buffer size (needed because we read close[1]/open[1] etc.
+// inside if/while branches, where Pine can't auto-detect the buffer length).
+indicator("All-in-One Trader (MA + S/R + RSI + Vol + Patterns)", "AIO Trader", overlay=false, max_bars_back=500, max_lines_count=500, max_labels_count=500)
 
 
 // =============================================================================
